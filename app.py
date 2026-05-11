@@ -191,14 +191,16 @@ def _import_core():
 
 # ── Presets ───────────────────────────────────────────────────────────────────
 PRESETS = {
-    "Custom":            None,
-    "Catonsville, MD":   (-76.755, 39.240, -76.680, 39.290),
-    "Baltimore, MD":     (-76.720, 39.250, -76.550, 39.380),
-    "Washington DC":     (-77.120, 38.800, -76.910, 38.990),
-    "New York City":     (-74.050, 40.680, -73.920, 40.800),
-    "Chesapeake Bay":    (-76.500, 38.700, -76.200, 39.000),
-    "Atlanta, GA":       (-84.500, 33.650, -84.300, 33.850),
-    "Houston, TX":       (-95.500, 29.650, -95.200, 29.850),
+    "Custom":                    None,
+    "Catonsville, MD":           (-76.755, 39.240, -76.680, 39.290),
+    "Baltimore, MD":             (-76.720, 39.250, -76.550, 39.380),
+    "Washington DC":             (-77.120, 38.800, -76.910, 38.990),
+    "New York City":             (-74.050, 40.680, -73.920, 40.800),
+    "Chesapeake Bay":            (-76.500, 38.700, -76.200, 39.000),
+    "Atlanta, GA":               (-84.500, 33.650, -84.300, 33.850),
+    "Houston, TX":               (-95.500, 29.650, -95.200, 29.850),
+    "Skaftafellsjökull, Iceland":(-17.050, 63.980, -16.850, 64.080),
+    "Strait of Hormuz":          ( 56.050, 26.200,  57.050, 26.800),
 }
 
 TASKS = {
@@ -275,14 +277,15 @@ with st.sidebar:
 
     use_cloud = st.checkbox("Ollama Cloud", value=bool(_secret_key))
     if use_cloud:
-        ollama_host = st.text_input("Host", value="https://api.ollama.ai")
+        ollama_host = st.text_input("Host", value="https://ollama.com")
         ollama_api_key = st.text_input("API key", value=_secret_key, type="password",
                                         help="Or set OLLAMA_API_KEY in Streamlit secrets")
     else:
         ollama_host    = st.text_input("Host", value="http://localhost:11434")
         ollama_api_key = ""
 
-    ollama_model = st.text_input("Model", value="llama3.2")
+    ollama_model = st.text_input("Model", value="gpt-oss:20b-cloud",
+                                  help="Cloud: gpt-oss:20b-cloud, llama3.2:cloud etc. Local: llama3.2")
     task_label   = st.selectbox("Task", list(TASKS.keys()),
                                  index=1 if enable_change else 0)
     task = TASKS[task_label]
