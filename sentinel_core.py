@@ -1,12 +1,8 @@
 """
-sentinel_core.py
-----------------
-Sentinel-2 L2A pipeline via Microsoft Planetary Computer STAC.
-No GEE. No sign-in. Read-only access via SAS token signing.
-
-Data: Microsoft Planetary Computer
-      https://planetarycomputer.microsoft.com
-      Collection: sentinel-2-l2a
+sentinel_core.py  v2
+--------------------
+Sentinel-2 L2A via Microsoft Planetary Computer STAC.
+No GEE. No sign-in. SAS token public read access.
 """
 
 import json
@@ -27,44 +23,35 @@ log = logging.getLogger("sentinel")
 
 try:
     import rasterio
-    from rasterio.crs import CRS
-    from rasterio.warp import transform_bounds
     from rasterio.windows import from_bounds as window_from_bounds
-    import rasterio.mask
+    import rasterio.windows
 except ImportError as e:
     raise ImportError("pip install rasterio") from e
 
 try:
     from pyproj import Transformer
-    from shapely.geometry import box, mapping
+    from shapely.geometry import box
 except ImportError as e:
     raise ImportError("pip install pyproj shapely") from e
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+PC_STAC_URL  = "https://planetarycomputer.microsoft.com/api/stac/v1"
+PC_TOKEN_URL = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
+COLLECTION   = "sentinel-2-l2a"
+SCL_VALID    = {4, 5, 6, 7, 11}
+HIST_BINS    = np.linspace(-1, 1, 41)
 
-PC_STAC_URL   = "https://planetarycomputer.microsoft.com/api/stac/v1"
-PC_TOKEN_URL  = "https://planetarycomputer.microsoft.com/api/sas/v1/token"
-COLLECTION    = "sentinel-2-l2a"
-
-# Band → asset key in PC S2 items
-BAND_ASSETS = {
-    "B02": "B02",   # Blue      10m
-    "B03": "B03",   # Green     10m
-    "B04": "B04",   # Red       10m
-    "B08": "B08",   # NIR       10m
-    "B11": "B11",   # SWIR-1    20m
-    "B12": "B12",   # SWIR-2    20m
-    "SCL": "SCL",   # Scene Classification 20m
+AOI_CONTEXT = {
+    "Catonsville, MD":            "Mid-Atlantic suburban/urban fringe, mixed deciduous forest and residential development.",
+    "Baltimore, MD":              "Dense Mid-Atlantic city with active port, urban heat island, Chesapeake Bay tributaries.",
+    "Washington DC":              "Dense federal urban core, Potomac/Anacostia rivers, significant impervious cover.",
+    "New York City":              "High-density coastal metropolis, Hudson/East rivers, major urban heat island.",
+    "Chesapeake Bay":             "Largest US estuary, mixed estuarine water, tidal wetlands, agricultural watershed.",
+    "Atlanta, GA":                "Rapidly urbanising Southern city, mixed pine/hardwood forest, strong urban heat island.",
+    "Houston, TX":                "Low-elevation Gulf Coast city, petrochemical industry, highly flood-prone, urban sprawl.",
+    "Skaftafellsjökull, Iceland": "Active outlet glacier on Vatnajökull ice cap. Expect NDSI>0.4 for clean ice/snow, low NDVI, meltwater channels (high NDWI near terminus), proglacial lake. Key signals: glacier retreat, bare ice exposure, supraglacial melt ponds.",
+    "Strait of Hormuz":           "Strategic 55km-wide waterway between Iran and Oman. Arid rocky coastline, shallow turbid water, strategic oil infrastructure. Expect low NDVI, high NDBI near ports, MNDWI distinguishes water from bare rock. Monitor ship traffic, coastal turbidity, shoreline change.",
 }
 
-# Spectral indices computed by this pipeline
-INDICES = ["NDVI", "NDWI", "NDBI", "EVI", "SAVI"]
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 
 @dataclass
 class AOI:
@@ -80,68 +67,52 @@ class AOI:
     def bbox(self):
         return [self.lon_min, self.lat_min, self.lon_max, self.lat_max]
 
-    def to_shapely(self):
-        return box(self.lon_min, self.lat_min, self.lon_max, self.lat_max)
+    def area_km2(self):
+        import math
+        lon_span = abs(self.lon_max - self.lon_min)
+        lat_span = abs(self.lat_max - self.lat_min)
+        lat_mid  = (self.lat_min + self.lat_max) / 2
+        km_per_lon = 111.32 * abs(math.cos(math.radians(lat_mid)))
+        return round(lon_span * km_per_lon * lat_span * 111.32, 1)
+
+    def context(self):
+        return AOI_CONTEXT.get(self.name, "")
 
 
 @dataclass
 class SceneResult:
-    """One Sentinel-2 scene's worth of extracted data."""
-    bands: dict           # band_name → (H, W) float32 array, scaled 0–1
-    indices: dict         # index_name → (H, W) float32 array
-    mask: np.ndarray      # (H, W) bool — True = valid (not cloud/shadow/nodata)
-    item_id: str
-    date: str
+    bands:       dict
+    indices:     dict
+    mask:        np.ndarray
+    item_id:     str
+    date:        str
     cloud_cover: float
-    aoi: AOI
-    crs: str
-    stats: dict = field(default_factory=dict)
+    aoi:         AOI
+    crs:         str
+    stats:       dict = field(default_factory=dict)
 
-
-# ---------------------------------------------------------------------------
-# SAS token signing (PC read access, no auth required for public data)
-# ---------------------------------------------------------------------------
 
 _token_cache: dict = {}
 
 def get_sas_token(collection: str = COLLECTION) -> str:
-    """Fetch a short-lived SAS token for PC blob storage access."""
     if collection in _token_cache:
         return _token_cache[collection]
-    url = f"{PC_TOKEN_URL}/{collection}"
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(f"{PC_TOKEN_URL}/{collection}", timeout=15)
         r.raise_for_status()
         token = r.json().get("token", "")
         _token_cache[collection] = token
-        log.info("Got SAS token for %s", collection)
         return token
     except Exception as e:
-        log.warning("SAS token fetch failed (%s) — URLs may still work unsigned", e)
+        log.warning("SAS token failed: %s", e)
         return ""
 
-
 def sign_url(href: str, token: str) -> str:
-    """Append SAS token to a PC blob storage URL."""
     if not token or "?" in href:
         return href
     return f"{href}?{token}"
 
-
-# ---------------------------------------------------------------------------
-# STAC search
-# ---------------------------------------------------------------------------
-
-def search_scenes(
-    aoi: AOI,
-    date_range: str,          # e.g. "2023-06-01/2023-09-01"
-    max_cloud: float = 20.0,
-    max_items: int = 5,
-) -> list[dict]:
-    """
-    Search PC STAC for Sentinel-2 L2A scenes over an AOI.
-    Returns list of STAC item dicts, sorted by cloud cover ascending.
-    """
+def search_scenes(aoi, date_range, max_cloud=20.0, max_items=8):
     payload = {
         "collections": [COLLECTION],
         "bbox": aoi.bbox(),
@@ -150,543 +121,413 @@ def search_scenes(
         "sortby": [{"field": "eo:cloud_cover", "direction": "asc"}],
         "limit": max_items,
     }
-
-    url = f"{PC_STAC_URL}/search"
-    log.info("Searching PC STAC: %s  clouds<%.0f%%  dates=%s", aoi.name, max_cloud, date_range)
-    r = requests.post(url, json=payload, timeout=30)
+    log.info("STAC search: %s %s cloud<%.0f%%", aoi.name, date_range, max_cloud)
+    r = requests.post(f"{PC_STAC_URL}/search", json=payload, timeout=30)
     r.raise_for_status()
-
     items = r.json().get("features", [])
     log.info("Found %d scene(s)", len(items))
     return items
 
-
-def best_scene(items: list[dict]) -> Optional[dict]:
-    """Return the scene with lowest cloud cover."""
+def best_scene(items):
     if not items:
         return None
-    return sorted(items, key=lambda x: x.get("properties", {}).get("eo:cloud_cover", 99))[0]
+    return sorted(items, key=lambda x: x["properties"].get("eo:cloud_cover", 99))[0]
 
+def scene_list_summary(items):
+    out = []
+    for it in items:
+        p = it.get("properties", {})
+        out.append({"id": it.get("id",""), "date": p.get("datetime","")[:10],
+                    "cloud": round(p.get("eo:cloud_cover", -1), 1)})
+    return sorted(out, key=lambda x: x["date"])
 
-# ---------------------------------------------------------------------------
-# Band reading
-# ---------------------------------------------------------------------------
+def _reproject_bbox(aoi, native_epsg):
+    if native_epsg == 4326:
+        return aoi.lon_min, aoi.lat_min, aoi.lon_max, aoi.lat_max
+    tr = Transformer.from_crs(4326, native_epsg, always_xy=True)
+    x0, y0 = tr.transform(aoi.lon_min, aoi.lat_min)
+    x1, y1 = tr.transform(aoi.lon_max, aoi.lat_max)
+    return min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)
 
-def read_band(
-    href: str,
-    aoi: AOI,
-    target_epsg: int = 4326,
-    overview_level: int = 0,
-) -> Optional[np.ndarray]:
-    """
-    Read a single band COG for the AOI window.
-    Returns (H, W) float32 scaled 0–1, or None on failure.
-    """
+def read_band(href, aoi, scale=10000.0):
     try:
         with rasterio.open(href) as src:
-            native_crs = src.crs.to_epsg() or 4326
-
-            # Reproject AOI bbox to band's native CRS
-            if native_crs != 4326:
-                tr = Transformer.from_crs(4326, native_crs, always_xy=True)
-                x0, y0 = tr.transform(aoi.lon_min, aoi.lat_min)
-                x1, y1 = tr.transform(aoi.lon_max, aoi.lat_max)
-            else:
-                x0, y0 = aoi.lon_min, aoi.lat_min
-                x1, y1 = aoi.lon_max, aoi.lat_max
-
-            left, right  = min(x0, x1), max(x0, x1)
-            bottom, top  = min(y0, y1), max(y0, y1)
-
+            epsg = src.crs.to_epsg() or 4326
+            left, bottom, right, top = _reproject_bbox(aoi, epsg)
             win = window_from_bounds(left, bottom, right, top, src.transform)
             win = win.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
-
+            if win.width < 1 or win.height < 1:
+                return None
             data = src.read(1, window=win).astype(np.float32)
-
-            # S2 L2A DN → reflectance (divide by 10000)
-            data = data / 10000.0
-            data = np.clip(data, 0, 1)
-
-            return data
-
+            return np.clip(data / scale, 0, 1)
     except Exception as e:
-        log.warning("Band read failed for %s: %s", href.split("/")[-1], e)
+        log.debug("Band read failed %s: %s", href.split("/")[-1], e)
         return None
 
-
-def read_scl(href: str, aoi: AOI) -> Optional[np.ndarray]:
-    """Read Scene Classification Layer (SCL) — uint8 class labels."""
+def read_scl(href, aoi):
     try:
         with rasterio.open(href) as src:
-            native_crs = src.crs.to_epsg() or 4326
-            if native_crs != 4326:
-                tr = Transformer.from_crs(4326, native_crs, always_xy=True)
-                x0, y0 = tr.transform(aoi.lon_min, aoi.lat_min)
-                x1, y1 = tr.transform(aoi.lon_max, aoi.lat_max)
-            else:
-                x0, y0 = aoi.lon_min, aoi.lat_min
-                x1, y1 = aoi.lon_max, aoi.lat_max
-
-            left, right  = min(x0, x1), max(x0, x1)
-            bottom, top  = min(y0, y1), max(y0, y1)
-
+            epsg = src.crs.to_epsg() or 4326
+            left, bottom, right, top = _reproject_bbox(aoi, epsg)
             win = window_from_bounds(left, bottom, right, top, src.transform)
             win = win.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+            if win.width < 1 or win.height < 1:
+                return None
             return src.read(1, window=win).astype(np.uint8)
     except Exception as e:
-        log.warning("SCL read failed: %s", e)
+        log.debug("SCL failed: %s", e)
         return None
 
+def align_shape(arr, target):
+    if arr is None or arr.shape == target:
+        return arr
+    try:
+        from skimage.transform import resize
+        return resize(arr, target, order=0, anti_aliasing=False,
+                      preserve_range=True).astype(arr.dtype)
+    except ImportError:
+        ry = max(1, target[0] // arr.shape[0])
+        rx = max(1, target[1] // arr.shape[1])
+        return np.repeat(np.repeat(arr, ry, 0), rx, 1)[:target[0], :target[1]]
 
-def scl_to_mask(scl: Optional[np.ndarray]) -> np.ndarray:
-    """
-    Convert SCL to a valid-pixel boolean mask.
-    SCL classes kept as valid: 4=Vegetation, 5=Not-vegetated, 6=Water,
-    7=Unclassified, 11=Snow/ice.
-    Classes masked out: 0=NoData, 1=Saturated, 2=Dark, 3=CloudShadow,
-    8=MedCloud, 9=HighCloud, 10=ThinCircus.
-    """
+def scl_to_mask(scl):
     if scl is None:
         return None
-    valid_classes = {4, 5, 6, 7, 11}
     mask = np.zeros(scl.shape, dtype=bool)
-    for cls in valid_classes:
+    for cls in SCL_VALID:
         mask |= (scl == cls)
     return mask
 
-
-def align_to_shape(arr: Optional[np.ndarray], target_shape: tuple) -> Optional[np.ndarray]:
-    """Resize array to target shape via nearest-neighbor (for 20m→10m bands)."""
-    if arr is None:
-        return None
-    if arr.shape == target_shape:
-        return arr
-    from skimage.transform import resize
-    return resize(arr, target_shape, order=0, anti_aliasing=False,
-                  preserve_range=True).astype(arr.dtype)
-
-
-# ---------------------------------------------------------------------------
-# Spectral indices
-# ---------------------------------------------------------------------------
-
-def safe_ratio(num: np.ndarray, denom: np.ndarray) -> np.ndarray:
-    """Compute ratio, returning 0 where denominator is near-zero."""
+def _ratio(num, denom):
     with np.errstate(divide="ignore", invalid="ignore"):
-        result = np.where(np.abs(denom) > 1e-6, num / denom, 0.0)
-    return result.astype(np.float32)
+        return np.where(np.abs(denom) > 1e-6, num / denom, 0.0).astype(np.float32)
 
-
-def compute_indices(bands: dict) -> dict:
-    """
-    Compute spectral indices from band reflectance arrays.
-    All inputs are float32 0–1.
-    """
-    indices = {}
-
-    B02 = bands.get("B02")  # Blue
-    B03 = bands.get("B03")  # Green
-    B04 = bands.get("B04")  # Red
-    B08 = bands.get("B08")  # NIR
-    B11 = bands.get("B11")  # SWIR-1
-    B12 = bands.get("B12")  # SWIR-2
-
-    # NDVI — vegetation vigour
+def compute_indices(bands):
+    B02=bands.get("B02"); B03=bands.get("B03"); B04=bands.get("B04")
+    B08=bands.get("B08"); B11=bands.get("B11"); B12=bands.get("B12")
+    idx = {}
     if B08 is not None and B04 is not None:
-        indices["NDVI"] = safe_ratio(B08 - B04, B08 + B04)
-
-    # NDWI — open water (McFeeters)
-    if B03 is not None and B08 is not None:
-        indices["NDWI"] = safe_ratio(B03 - B08, B03 + B08)
-
-    # NDBI — built-up / impervious
-    if B11 is not None and B08 is not None:
-        indices["NDBI"] = safe_ratio(B11 - B08, B11 + B08)
-
-    # EVI — enhanced vegetation index
+        idx["NDVI"]  = _ratio(B08-B04, B08+B04)
     if B08 is not None and B04 is not None and B02 is not None:
-        num = 2.5 * (B08 - B04)
-        den = B08 + 6.0 * B04 - 7.5 * B02 + 1.0
-        indices["EVI"] = safe_ratio(num, den)
-
-    # SAVI — soil-adjusted vegetation (L=0.5)
+        idx["EVI"]   = _ratio(2.5*(B08-B04), B08+6*B04-7.5*B02+1)
     if B08 is not None and B04 is not None:
-        L = 0.5
-        indices["SAVI"] = safe_ratio(
-            1.5 * (B08 - B04),
-            B08 + B04 + L
-        )
-
-    # MNDWI — modified NDWI (Xu 2006) uses Green/SWIR-1
+        idx["SAVI"]  = _ratio(1.5*(B08-B04), B08+B04+0.5)
+    if B03 is not None and B08 is not None:
+        idx["NDWI"]  = _ratio(B03-B08, B03+B08)
     if B03 is not None and B11 is not None:
-        indices["MNDWI"] = safe_ratio(B03 - B11, B03 + B11)
+        idx["MNDWI"] = _ratio(B03-B11, B03+B11)
+    if B11 is not None and B08 is not None:
+        idx["NDBI"]  = _ratio(B11-B08, B11+B08)
+    if B04 is not None and B08 is not None and B02 is not None and B11 is not None:
+        idx["BSI"]   = _ratio((B11+B04)-(B08+B02), (B11+B04)+(B08+B02))
+    if B03 is not None and B11 is not None:
+        idx["NDSI"]  = _ratio(B03-B11, B03+B11)
+    if B08 is not None and B12 is not None:
+        idx["NBR"]   = _ratio(B08-B12, B08+B12)
+    if B04 is not None and B08 is not None:
+        denom = (0.1-B04)**2 + (0.06-B08)**2
+        with np.errstate(divide="ignore", invalid="ignore"):
+            bai = np.where(denom > 1e-8, 1.0/denom, 0.0).astype(np.float32)
+        idx["BAI"] = np.clip(np.log1p(bai) / 10.0, 0, 1)
+    return {k: np.clip(v, -1, 1) for k, v in idx.items()}
 
-    return {k: np.clip(v, -1, 1) for k, v in indices.items()}
+def _stretch(arr, p_low=2, p_high=98):
+    valid = arr[arr > 0]
+    if len(valid) == 0:
+        return arr
+    lo, hi = np.percentile(valid, [p_low, p_high])
+    return np.clip((arr - lo) / max(hi - lo, 1e-6), 0, 1)
 
-
-def true_color_rgb(bands: dict, gamma: float = 2.2) -> Optional[np.ndarray]:
-    """Return uint8 (H, W, 3) true-color RGB from B04/B03/B02."""
-    r, g, b = bands.get("B04"), bands.get("B03"), bands.get("B02")
+def true_color_rgb(bands):
+    r,g,b = bands.get("B04"), bands.get("B03"), bands.get("B02")
     if r is None or g is None or b is None:
         return None
-    # Stretch to 2–98th percentile then gamma
-    def stretch(arr):
-        p2, p98 = np.percentile(arr[arr > 0], [2, 98]) if (arr > 0).any() else (0, 1)
-        arr = np.clip((arr - p2) / max(p98 - p2, 1e-6), 0, 1)
-        return (arr ** (1 / gamma) * 255).astype(np.uint8)
-    return np.stack([stretch(r), stretch(g), stretch(b)], axis=-1)
+    rgb = np.stack([_stretch(r), _stretch(g), _stretch(b)], axis=-1)
+    return (np.clip(rgb**0.454, 0, 1) * 255).astype(np.uint8)
 
-
-def false_color_rgb(bands: dict) -> Optional[np.ndarray]:
-    """NIR/Red/Green false-color composite — vegetation in red."""
-    nir, r, g = bands.get("B08"), bands.get("B04"), bands.get("B03")
+def false_color_rgb(bands):
+    nir,r,g = bands.get("B08"), bands.get("B04"), bands.get("B03")
     if nir is None or r is None or g is None:
         return None
-    def stretch(arr):
-        p2, p98 = np.percentile(arr[arr > 0], [2, 98]) if (arr > 0).any() else (0, 1)
-        return np.clip((arr - p2) / max(p98 - p2, 1e-6), 0, 1)
-    rgb = np.stack([stretch(nir), stretch(r), stretch(g)], axis=-1)
-    return (rgb * 255).astype(np.uint8)
+    rgb = np.stack([_stretch(nir), _stretch(r), _stretch(g)], axis=-1)
+    return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
+def swir_composite(bands):
+    s1,nir,r = bands.get("B11"), bands.get("B08"), bands.get("B04")
+    if s1 is None or nir is None or r is None:
+        return None
+    rgb = np.stack([_stretch(s1), _stretch(nir), _stretch(r)], axis=-1)
+    return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
-# ---------------------------------------------------------------------------
-# Scene extraction
-# ---------------------------------------------------------------------------
+def index_colormap(arr, mask, cmap_name, vmin=-1, vmax=1):
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+    masked = np.where(mask, arr, np.nan)
+    norm   = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    rgba   = cm.get_cmap(cmap_name)(norm(masked), bytes=True)
+    rgba[~mask] = [15, 20, 30, 255]
+    return rgba[:, :, :3]
 
-def extract_scene(item: dict, aoi: AOI, token: str = "") -> Optional[SceneResult]:
-    """
-    Given a STAC item, read all bands and compute indices for the AOI.
-    Returns a SceneResult.
-    """
+def extract_scene(item, aoi, token=""):
     assets = item.get("assets", {})
     props  = item.get("properties", {})
-    item_id    = item.get("id", "unknown")
-    date       = props.get("datetime", "")[:10]
+    item_id     = item.get("id", "unknown")
+    date        = props.get("datetime", "")[:10]
     cloud_cover = float(props.get("eo:cloud_cover", -1))
+    log.info("Extracting %s (%s %.1f%% cloud)", item_id, date, cloud_cover)
 
-    log.info("Extracting scene %s (%s, %.1f%% cloud)", item_id, date, cloud_cover)
+    def href(b):
+        h = assets.get(b, {}).get("href", "")
+        return f"/vsicurl/{sign_url(h, token)}" if h else ""
 
-    # Read SCL first to get CRS/shape reference
-    scl_href = assets.get("SCL", {}).get("href", "")
-    if scl_href and token:
-        scl_href = sign_url(scl_href, token)
-
-    # Read 10m bands
     bands = {}
     ref_shape = None
-    for band in ["B04", "B03", "B02", "B08"]:
-        href = assets.get(band, {}).get("href", "")
-        if not href:
-            continue
-        if token:
-            href = sign_url(href, token)
-        arr = read_band(f"/vsicurl/{href}", aoi)
-        if arr is not None:
-            bands[band] = arr
-            if ref_shape is None:
-                ref_shape = arr.shape
+    for b in ["B04","B03","B02","B08"]:
+        h = href(b)
+        if not h: continue
+        arr = read_band(h, aoi)
+        if arr is not None and arr.size > 0:
+            bands[b] = arr
+            if ref_shape is None: ref_shape = arr.shape
 
-    if not bands:
-        log.warning("No bands read for scene %s", item_id)
+    if ref_shape is None or ref_shape[0] < 2 or ref_shape[1] < 2:
+        log.warning("No usable 10m bands for %s", item_id)
         return None
 
-    if ref_shape is None:
-        return None
-
-    # Read 20m bands and upscale
-    for band in ["B11", "B12"]:
-        href = assets.get(band, {}).get("href", "")
-        if not href:
-            continue
-        if token:
-            href = sign_url(href, token)
-        arr = read_band(f"/vsicurl/{href}", aoi)
+    for b in ["B11","B12"]:
+        h = href(b)
+        if not h: continue
+        arr = read_band(h, aoi)
         if arr is not None:
-            bands[band] = align_to_shape(arr, ref_shape)
+            bands[b] = align_shape(arr, ref_shape)
 
-    # SCL mask
-    scl = None
-    if scl_href:
-        scl = read_scl(f"/vsicurl/{scl_href}", aoi)
-        if scl is not None:
-            scl = align_to_shape(scl, ref_shape)
-
+    scl_h = href("SCL")
+    scl   = read_scl(scl_h, aoi) if scl_h else None
+    if scl is not None:
+        scl = align_shape(scl, ref_shape)
     mask = scl_to_mask(scl)
     if mask is None:
-        # Fallback: mask where all 10m bands are > 0
         mask = np.ones(ref_shape, dtype=bool)
-        for b in ["B04", "B03", "B02", "B08"]:
-            if b in bands:
-                mask &= (bands[b] > 0)
+        for b in ["B04","B03","B02"]:
+            if b in bands: mask &= (bands[b] > 0)
 
-    # Indices
     indices = compute_indices(bands)
 
-    # Get CRS from first band href
-    crs_str = "EPSG:32618"  # default
+    crs_str = "EPSG:32618"
     try:
-        first_href = list(assets.values())[0].get("href", "")
-        if first_href and token:
-            first_href = sign_url(first_href, token)
-        with rasterio.open(f"/vsicurl/{first_href}") as src:
-            crs_str = src.crs.to_string()
+        first_h = href(list(assets.keys())[0])
+        if first_h:
+            with rasterio.open(first_h) as src:
+                crs_str = src.crs.to_string()
     except Exception:
         pass
 
-    result = SceneResult(
-        bands=bands,
-        indices=indices,
-        mask=mask,
-        item_id=item_id,
-        date=date,
-        cloud_cover=cloud_cover,
-        aoi=aoi,
-        crs=crs_str,
-    )
+    result = SceneResult(bands=bands, indices=indices, mask=mask,
+                         item_id=item_id, date=date, cloud_cover=cloud_cover,
+                         aoi=aoi, crs=crs_str)
     result.stats = compute_stats(result)
     return result
 
-
-# ---------------------------------------------------------------------------
-# Statistics
-# ---------------------------------------------------------------------------
-
-def compute_stats(scene: SceneResult) -> dict:
-    """Compute per-index and per-band statistics for LLM consumption."""
-    mask = scene.mask
+def compute_stats(scene):
+    mask    = scene.mask
     n_valid = int(mask.sum())
     n_total = int(mask.size)
-
     stats = {
-        "aoi": scene.aoi.name,
-        "date": scene.date,
-        "item_id": scene.item_id,
-        "cloud_cover_pct": round(scene.cloud_cover, 1),
-        "valid_px": n_valid,
-        "total_px": n_total,
+        "aoi":          scene.aoi.name,
+        "aoi_area_km2": scene.aoi.area_km2(),
+        "aoi_context":  scene.aoi.context(),
+        "date":         scene.date,
+        "item_id":      scene.item_id,
+        "cloud_pct":    round(scene.cloud_cover, 1),
+        "valid_px":     n_valid,
+        "total_px":     n_total,
         "coverage_pct": round(100 * n_valid / max(n_total, 1), 1),
-        "bands_read": sorted(scene.bands.keys()),
-        "indices": {},
+        "pixel_res_m":  10,
+        "bands_read":   sorted(scene.bands.keys()),
+        "indices":      {},
+        "histograms":   {},
     }
-
     for name, arr in scene.indices.items():
         valid = arr[mask]
-        if len(valid) == 0:
-            continue
+        if len(valid) < 4: continue
+        hist, _ = np.histogram(valid, bins=HIST_BINS)
         stats["indices"][name] = {
-            "mean":   round(float(valid.mean()), 4),
-            "std":    round(float(valid.std()),  4),
-            "median": round(float(np.median(valid)), 4),
-            "p10":    round(float(np.percentile(valid, 10)), 4),
-            "p90":    round(float(np.percentile(valid, 90)), 4),
+            "mean":         round(float(valid.mean()), 4),
+            "std":          round(float(valid.std()),  4),
+            "median":       round(float(np.median(valid)), 4),
+            "p10":          round(float(np.percentile(valid, 10)), 4),
+            "p25":          round(float(np.percentile(valid, 25)), 4),
+            "p75":          round(float(np.percentile(valid, 75)), 4),
+            "p90":          round(float(np.percentile(valid, 90)), 4),
             "pct_positive": round(float((valid > 0).mean() * 100), 1),
         }
+        stats["histograms"][name] = hist.tolist()
 
-    # Land cover proxies from index thresholds
     if "NDVI" in scene.indices:
-        ndvi = scene.indices["NDVI"][mask]
-        stats["land_cover_proxy"] = {
-            "dense_veg_pct":   round(float((ndvi > 0.5).mean() * 100), 1),
-            "sparse_veg_pct":  round(float(((ndvi > 0.2) & (ndvi <= 0.5)).mean() * 100), 1),
-            "barren_pct":      round(float(((ndvi >= -0.1) & (ndvi <= 0.2)).mean() * 100), 1),
-            "water_snow_pct":  round(float((ndvi < -0.1).mean() * 100), 1),
+        v = scene.indices["NDVI"][mask]
+        stats["land_cover"] = {
+            "dense_veg_pct":  round(float((v > 0.5).mean()  * 100), 1),
+            "sparse_veg_pct": round(float(((v>0.2)&(v<=0.5)).mean()*100),1),
+            "barren_pct":     round(float(((v>=-0.1)&(v<=0.2)).mean()*100),1),
+            "water_snow_pct": round(float((v<-0.1).mean()*100),1),
         }
     if "NDWI" in scene.indices:
-        ndwi = scene.indices["NDWI"][mask]
-        stats["water_pct"] = round(float((ndwi > 0).mean() * 100), 1)
-
+        stats["water_pct"]    = round(float((scene.indices["NDWI"][mask]>0).mean()*100),1)
     if "NDBI" in scene.indices:
-        ndbi = scene.indices["NDBI"][mask]
-        stats["built_up_pct"] = round(float((ndbi > 0).mean() * 100), 1)
-
+        stats["built_up_pct"] = round(float((scene.indices["NDBI"][mask]>0).mean()*100),1)
+    if "NDSI" in scene.indices:
+        stats["snow_ice_pct"] = round(float((scene.indices["NDSI"][mask]>0.4).mean()*100),1)
+    if "NBR" in scene.indices:
+        stats["burn_pct"]     = round(float((scene.indices["NBR"][mask]<-0.1).mean()*100),1)
     return stats
 
+def _days_apart(d1, d2):
+    try:
+        from datetime import date
+        return abs((date.fromisoformat(d2)-date.fromisoformat(d1)).days)
+    except Exception:
+        return -1
 
-def compute_change_stats(s1: SceneResult, s2: SceneResult) -> dict:
-    """Compare two scenes: per-index mean change and area shifts."""
-    stats = {
-        "aoi":    s1.aoi.name,
-        "date_t1": s1.date,
-        "date_t2": s2.date,
-        "index_changes": {},
-        "land_cover_change": {},
+def compute_change_stats(s1, s2):
+    out = {
+        "aoi":              s1.aoi.name,
+        "aoi_context":      s1.aoi.context(),
+        "date_t1":          s1.date,
+        "date_t2":          s2.date,
+        "days_apart":       _days_apart(s1.date, s2.date),
+        "index_changes":    {},
+        "land_cover_change":{},
     }
-
-    for idx in set(s1.indices) & set(s2.indices):
+    for idx in sorted(set(s1.indices) & set(s2.indices)):
         a1 = s1.indices[idx][s1.mask]
         a2 = s2.indices[idx][s2.mask]
-        if len(a1) == 0 or len(a2) == 0:
-            continue
-        stats["index_changes"][idx] = {
-            "mean_t1":   round(float(a1.mean()), 4),
-            "mean_t2":   round(float(a2.mean()), 4),
-            "delta":     round(float(a2.mean() - a1.mean()), 4),
-            "delta_pct": round(float((a2.mean() - a1.mean()) / max(abs(a1.mean()), 1e-6) * 100), 1),
+        if len(a1) < 4 or len(a2) < 4: continue
+        delta = float(a2.mean() - a1.mean())
+        out["index_changes"][idx] = {
+            "mean_t1":   round(float(a1.mean()),4),
+            "mean_t2":   round(float(a2.mean()),4),
+            "delta":     round(delta,4),
+            "delta_pct": round(delta/max(abs(float(a1.mean())),1e-6)*100,1),
+            "std_t1":    round(float(a1.std()),4),
+            "std_t2":    round(float(a2.std()),4),
         }
-
-    lc1 = s1.stats.get("land_cover_proxy", {})
-    lc2 = s2.stats.get("land_cover_proxy", {})
+    lc1 = s1.stats.get("land_cover",{})
+    lc2 = s2.stats.get("land_cover",{})
     for k in lc1:
         if k in lc2:
-            stats["land_cover_change"][k] = {
-                "t1_pct": lc1[k], "t2_pct": lc2[k],
-                "delta":  round(lc2[k] - lc1[k], 1),
-            }
+            out["land_cover_change"][k] = {"t1":lc1[k],"t2":lc2[k],"delta":round(lc2[k]-lc1[k],1)}
+    return out
 
-    return stats
+def change_map(s1, s2, index="NDVI"):
+    i1 = s1.indices.get(index)
+    i2 = s2.indices.get(index)
+    if i1 is None or i2 is None: return None
+    if i1.shape != i2.shape:
+        i2 = align_shape(i2, i1.shape)
+    joint = s1.mask & align_shape(s2.mask.astype(np.uint8), s1.mask.shape).astype(bool)
+    return np.where(joint, i2-i1, np.nan).astype(np.float32)
 
+_SYSTEM = (
+    "You are an expert remote sensing scientist specialising in Sentinel-2 spectral analysis. "
+    "You give precise, quantitative, actionable interpretations grounded in the data provided. "
+    "You never fabricate causes or invent data not present. "
+    "You acknowledge uncertainty and seasonal confounders where relevant."
+)
 
-# ---------------------------------------------------------------------------
-# Ollama Cloud
-# ---------------------------------------------------------------------------
+def query_ollama(stats, change_stats=None, model="gpt-oss:20b-cloud",
+                 host="https://ollama.com", api_key=None, task="interpret"):
+    aoi_ctx  = stats.get("aoi_context","")
+    aoi_name = stats.get("aoi","")
+    ctx_line = f"\nKnown AOI context: {aoi_ctx}" if aoi_ctx else ""
+    clean_stats = {k:v for k,v in stats.items() if k not in ("histograms","aoi_context")}
 
-def query_ollama(
-    stats: dict,
-    change_stats: Optional[dict] = None,
-    model: str = "llama3.2",
-    host: str = "https://api.ollama.ai",
-    api_key: Optional[str] = None,
-    task: str = "interpret",
-) -> str:
-    """
-    Send spectral stats to Ollama Cloud (or local) for interpretation.
-
-    Cloud (api_key set): POST /v1/chat/completions with Bearer auth
-    Local (no api_key):  POST /api/chat
-    """
     if task == "change" and change_stats:
-        prompt = f"""You are a remote sensing analyst interpreting Sentinel-2 spectral change signals.
+        prompt = f"""Sentinel-2 L2A multi-temporal analysis.
+AOI: {aoi_name}{ctx_line}
+Period: {change_stats['date_t1']} → {change_stats['date_t2']} ({change_stats['days_apart']} days)
 
-Spectral statistics — {change_stats['date_t1']} vs {change_stats['date_t2']}:
-{json.dumps(change_stats, indent=2)}
+Index changes:
+{json.dumps(change_stats['index_changes'], indent=2)}
 
-Scene details t1:
-{json.dumps({k: v for k, v in stats.items() if k != 'indices'}, indent=2)}
+Land cover shifts:
+{json.dumps(change_stats.get('land_cover_change',{}), indent=2)}
 
-Provide:
-1. What the index changes suggest about land-cover or environmental change
-2. Which indices show the strongest signal and what that implies
-3. Likely drivers of any vegetation, water, or built-up shifts
-4. Confidence and caveats (cloud cover, seasonality, etc.)
-5. Recommended follow-up analyses
+Baseline stats ({change_stats['date_t1']}):
+{json.dumps(clean_stats, indent=2)}
 
-Be quantitative. Reference specific index values. Do not fabricate causes."""
+Structure your response with these headers:
+## Magnitude
+## Interpretation
+## Seasonality
+## Confidence & Caveats
+## Priority Follow-ups
+## Headline (one sentence)"""
 
     elif task == "report":
-        prompt = f"""You are a remote sensing scientist. Write a concise technical paragraph (4-6 sentences)
-for a methods/results section based on this Sentinel-2 L2A spectral analysis:
-
-{json.dumps(stats, indent=2)}
-
-Include: AOI, acquisition date, cloud cover, bands used, key index values, and landscape interpretation."""
+        prompt = f"""Write a technical remote sensing results paragraph (5-7 sentences) for a scientific report.
+AOI: {aoi_name}{ctx_line}
+Data: Sentinel-2 L2A via Microsoft Planetary Computer
+{json.dumps(clean_stats, indent=2)}
+Use passive academic voice. Cover: date, cloud cover, resolution, bands, all index values, land cover, data quality."""
 
     else:
-        prompt = f"""You are a remote sensing analyst. Interpret these Sentinel-2 L2A spectral statistics
-for a study area. All indices are computed from surface reflectance (L2A).
+        prompt = f"""Interpret Sentinel-2 L2A surface reflectance statistics for {aoi_name}.{ctx_line}
 
-{json.dumps(stats, indent=2)}
+{json.dumps(clean_stats, indent=2)}
 
-Provide:
-1. Overall landscape character based on NDVI, NDWI, NDBI values
-2. Estimated land cover composition (vegetation, water, built-up, bare soil)
-3. Data quality assessment (cloud cover, coverage)
-4. Notable spectral patterns or anomalies
-5. Suggested follow-up analyses"""
+Structure your response with these headers:
+## Landscape Character
+## Land Cover Composition
+## Environmental Signals
+## Data Quality
+## Recommended Next Steps
+## Headline (one sentence)"""
 
-    messages = [{"role": "user", "content": prompt}]
-
+    messages = [
+        {"role":"system","content":_SYSTEM},
+        {"role":"user",  "content":prompt},
+    ]
+    url     = f"{host.rstrip('/')}/api/chat"
+    headers = {"Content-Type":"application/json"}
     if api_key:
-        url = f"{host.rstrip('/')}/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": model, "messages": messages, "stream": False}
-        try:
-            r = httpx.post(url, json=payload, headers=headers, timeout=120)
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
-        except httpx.HTTPStatusError as e:
-            return f"[HTTP {e.response.status_code}]: {e.response.text[:300]}"
-        except Exception as e:
-            return f"[Ollama Cloud error]: {e}"
-    else:
-        url = f"{host.rstrip('/')}/api/chat"
-        payload = {"model": model, "messages": messages, "stream": False}
-        try:
-            r = httpx.post(url, json=payload, timeout=120)
-            r.raise_for_status()
-            return r.json()["message"]["content"]
-        except httpx.ConnectError:
-            return f"[Ollama not reachable at {host} — ensure 'ollama serve' is running]"
-        except Exception as e:
-            return f"[Ollama local error]: {e}"
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        r = httpx.post(url, json={"model":model,"messages":messages,"stream":False},
+                       headers=headers, timeout=180)
+        r.raise_for_status()
+        return r.json()["message"]["content"]
+    except httpx.HTTPStatusError as e:
+        return f"[HTTP {e.response.status_code}]: {e.response.text[:400]}"
+    except Exception as e:
+        return f"[Ollama error]: {e}"
 
-
-# ---------------------------------------------------------------------------
-# High-level pipeline
-# ---------------------------------------------------------------------------
-
-def run_pipeline(
-    aoi: AOI,
-    date_range: str,
-    max_cloud: float = 20.0,
-    compare_date_range: Optional[str] = None,
-    ollama_model: str = "llama3.2",
-    ollama_host: str = "https://api.ollama.ai",
-    ollama_api_key: Optional[str] = None,
-    task: str = "interpret",
-) -> dict:
-    """
-    Full pipeline:
-      1. STAC search on Planetary Computer
-      2. SAS token sign
-      3. Read bands + compute indices for best scene
-      4. Optionally repeat for a second date range (change detection)
-      5. Compute stats and query Ollama
-    """
+def run_pipeline(aoi, date_range, max_cloud=20.0, compare_date_range=None,
+                 ollama_model="gpt-oss:20b-cloud", ollama_host="https://ollama.com",
+                 ollama_api_key=None, task="interpret"):
     results = {"aoi": aoi}
-
-    token = get_sas_token()
-
-    # Primary scene
-    items1 = search_scenes(aoi, date_range, max_cloud=max_cloud)
+    token   = get_sas_token()
+    items1  = search_scenes(aoi, date_range, max_cloud=max_cloud)
     if not items1:
-        results["error"] = f"No scenes found for {aoi.name} in {date_range} with cloud < {max_cloud}%"
+        results["error"] = f"No scenes for {aoi.name} in {date_range} cloud<{max_cloud}%"
         return results
-
-    item1 = best_scene(items1)
+    item1  = best_scene(items1)
     scene1 = extract_scene(item1, aoi, token)
     if scene1 is None:
         results["error"] = "Scene extraction failed"
         return results
-
-    results["scene1"] = scene1
-    results["items1"] = items1
-
-    # Optional comparison scene
+    results.update(scene1=scene1, items1=items1, scene_catalog=scene_list_summary(items1))
     scene2 = None
+    change_stats = None
     if compare_date_range:
         items2 = search_scenes(aoi, compare_date_range, max_cloud=max_cloud)
         if items2:
-            item2 = best_scene(items2)
-            scene2 = extract_scene(item2, aoi, token)
-            results["scene2"] = scene2
-            results["items2"] = items2
-
-    # Stats
-    change_stats = None
-    if scene2:
-        change_stats = compute_change_stats(scene1, scene2)
-        results["change_stats"] = change_stats
-
-    # Ollama
-    effective_task = "change" if change_stats else task
-    llm_response = query_ollama(
-        scene1.stats,
-        change_stats=change_stats,
-        model=ollama_model,
-        host=ollama_host,
-        api_key=ollama_api_key,
-        task=effective_task,
-    )
-    results["llm_response"] = llm_response
-
+            scene2 = extract_scene(best_scene(items2), aoi, token)
+            if scene2:
+                results.update(scene2=scene2, items2=items2)
+                change_stats = compute_change_stats(scene1, scene2)
+                results["change_stats"] = change_stats
+    results["llm_response"] = query_ollama(
+        scene1.stats, change_stats=change_stats, model=ollama_model,
+        host=ollama_host, api_key=ollama_api_key,
+        task="change" if change_stats else task)
     return results
